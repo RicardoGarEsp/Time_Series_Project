@@ -1,0 +1,632 @@
+---
+title: "Forecastig de Serie de Tiempo de Jugadores de CS:GO"
+author: "Ricardo García Espinosa"
+date: "2024-11-20"
+output:
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list = ls(all.names = TRUE))
+gc() # Liberamos memoria
+# Librerías
+library(dplyr)      # Para el manejo de datos
+library(ggplot2)    # Para realizar gráficas
+library(kableExtra) # Para un mejor manejo de tablas
+library(GGally)    # Para realizar análisis descriptivo fácilmente
+library(multcomp)  # Para pruebas de hipótesis
+library(car)      # Para funciones útiles de modelos de regresión lineal múltiple
+library(broom)      # Para obtener los residuales estandarizados
+library(lmtest)
+library(seastests)
+library(forecast)
+library(nortest)
+library(lubridate)
+library(tseries)
+```
+
+## Introducción
+
+Este documento presenta un análisis de los jugadores diarios del juego Counter Strike: Global Offensive, utilizando datos desde junio de 2012 hasta agosto de 2024.
+
+```{r,echo=FALSE}
+data <- read.csv('counter_strike.csv')
+#limpieza de los datos para evitar problemas con valores NA
+
+print('.........................................Players.....................................')
+summary(data$Players)
+print('.......................................Players.av....................................')
+summary(data$Average.Players)
+print('.....................................................................................')
+
+#Notamos que hay valores NA en las columnas 'Players' y 'Average.Players'
+
+#Los datos de Average players no es claro cada cuanto lo obtienen
+#El análisis sera respecto a el número de jugadores diario
+
+data <- data[,1:2]
+
+cat("Inicio de la serie: ", min(data$DateTime))
+cat("Fin de la serie: ", max(data$DateTime))
+
+#Quitamos la hora, minuto y segundo de la columna 'DateTime'
+data$DateTime<- as.Date(data$DateTime)
+```
+
+```{r data_filtred, include=FALSE}
+#Dado que hay muchos NA antes de junio 2012 y los datos de septiembre 2024 no consideran las observaciones de todo el mes, vamos a trabajar con los datos desde junio 2012 hasta agosto 2024
+
+data_filtered <- data %>% filter(DateTime >= as.Date("2012-06-01") & DateTime <= as.Date("2024-08-31"))
+```
+
+Se analiza la relación entre el la fecha y el promedio de jugadores. Aunque la fecha oficial de lanzamiento fue en Agosto del 2012, existió acceso anticipado desde diciembre del 2011.
+
+
+```{r plot_dataOG,echo=FALSE,fig.dim=c(7,3.4)}
+plot(data_filtered$DateTime,data_filtered$Players,type='l',main='Observaciones diarias',xlab = 'Años',ylab = "Players")
+```
+
+
+Se puede notar que, hay partes en donde no hay datos, para facilidad del análisis, se calculan los promedios semanales y mensuales por año, como el comportamiento de la serie semanal no se ve afectado en el promedio mensual será plausible trabajar con los promedios mensuales.
+
+```{r plot_promedios, include=FALSE}
+# Calculamos promedios semanales y mensuales
+data_filtered = data_filtered %>%
+  mutate(week_of_month = ceiling(day(DateTime) / 7)) %>%
+  mutate(week_of_month = ifelse(week_of_month == 5, 4, week_of_month)) %>%
+  mutate(month_year = paste(year(DateTime), month(DateTime), sep = "-"))
+
+# Promedio semanal
+data_week_avg = data_filtered %>%
+  group_by(month_year, week_of_month) %>%
+  summarize(weekly_avg = mean(Players, na.rm = TRUE))
+
+#Ordeno por el mes y año y su semana
+data_week_avg$month_year = as.Date(paste0(data_week_avg$month_year, "-01"))
+data_week_avg = data_week_avg[order(data_week_avg$month_year,
+                                    data_week_avg$week_of_month),]
+
+
+# Promedio mensual
+data_month_avg = data_filtered %>%
+  group_by(month_year) %>%
+  summarize(monthly_avg = mean(Players, na.rm = TRUE)) 
+
+
+#Ordeno por el mes y año
+data_month_avg$month_year = as.Date(paste0(data_month_avg$month_year, "-01"))
+data_month_avg = data_month_avg[order(data_month_avg$month_year),]
+
+```
+
+
+
+```{r, echo=FALSE,fig.dim=c(7,4.5)}
+par(mar=c(2,2,2,1))
+par(mfrow = c(2, 1))
+plot((1:length(data_week_avg$weekly_avg)),data_week_avg$weekly_avg,
+     type = "o",xlab="Semana",ylab="Promedio",
+     main = "Promedio semanal de jugadores por mes")
+plot(data_month_avg$month_year,data_month_avg$monthly_avg,
+     type = "o",xlab="Mes",ylab="Promedio",
+     main = "Promedio mensual de jugadores por mes")
+par(mfrow = c(2, 1))
+```
+\newline
+
+Analizando el promedio mensual de jugadores
+
+```{r plot_series, echo=FALSE,fig.dim=c(7,3)}
+#Transformaremos la serie en un objeto ts
+#Con esta serie se realiza el analisis
+
+Xt_players <- ts(data=data_month_avg$monthly_avg,start=c(2012,6),end = c(2024,8),frequency =12)
+par(mar=c(2,2,2,1))
+plot(Xt_players,type = "l", main = "Promedio mensual de jugadores")
+
+
+```
+
+\subsection{Descomposición  de la Serie:}
+
+```{r decomp_serie, echo=FALSE, fig.dim=c(7,4)}
+plot(decompose(Xt_players,type="multiplicative"))
+
+```
+
+Esta serie consta de 12 años de observaciones mensuales y parece existir una tendencia creciente, Se observa una posible varianza no constante y no aparenta estacionariedad. El efecto estacional parece aumentar con el nivel de la serie, lo que sugiere una posible relación multiplicativa entre la tendencia y la estacionalidad.
+
+A continuación se verifica estadísticamente.
+
+Para la estacionalidad usar la prueba de Kruskal-Wallis, con $\alpha=0.05$, buscamos rechazar H0, p-value = 0.00017. Entonces:
+
+```{r, echo=FALSE}
+alpha = 0.05
+
+#Estacionalidad KW
+
+resultkw <- ifelse(kw(Xt_players, freq = 12)$Pval < alpha,
+                "Hay evidencia de estacionalidad",
+                "No hay evidencia de estacionalidad")
+
+cat("### Resultados de la Prueba de Kruskall Wallis\n\n",
+    "- **Prueba**: Kruskall-Wallis (kw)\n",
+    "- **Resultado**: ", resultkw, "\n", sep = "")
+
+```
+
+Con $bptest$, $ncvTest$ y con $\alpha=0.05$ buscamos no rechazar H0 para que sea plausible la Homocedasticidad. Obtenemos P-values menores a $\alpha$. Por lo tanto :
+
+```{r, echo=FALSE}
+dataDF = data.frame(
+  tiempo = time(Xt_players),     
+  players = as.vector(Xt_players)
+)
+
+reg_mod1  = lm(players ~ tiempo , data = dataDF)
+```
+
+Bajo la prueba de $bptest$ se tiene que
+
+```{r, echo=FALSE}
+resultbp <- ifelse(bptest(reg_mod1)$p.value < alpha,
+                    "Es heterocedástica",
+                    "Evidencia de homocedasticidad")
+
+cat("### Resultados de la Prueba de Breusch-Pagan\n\n",
+    "- **Prueba**: Breusch-Pagan (BP)\n",
+    "- **Resultado**: ", resultbp, "\n", sep = "")
+
+```
+Bajo la prueba de $ncvTest$ se tiene que  
+
+```{r, echo=FALSE}
+
+resultncv <- ifelse(ncvTest(reg_mod1)$p < alpha,
+                    "Es heterocedástica",
+                    "Evidencia de homocedasticidad")
+
+cat("### Resultados de la Prueba de Non-Constant Variance\n\n",
+    "- **Prueba**: Non-Constant Variance (ncv)\n",
+    "- **Resultado**: ", resultncv, "\n", sep = "")
+
+```
+
+Hay evidencia en contra de la homocedasticidad en ambas pruebas.
+
+Para ver si hay estacionariedad se usa la Prueba Dickey-Fuller Aumentada (ADF), buscamos rechazar H0 para asegurar estacionariedad. Esta es robusta para decirnos si cuenta con varianza y media constantes.
+
+```{r, echo=FALSE}
+
+resultadf <- ifelse(adf.test(Xt_players)$p.value < alpha,
+                    "Hay evidencia de estacionariedad", 
+                    "No es estacionaria")
+
+cat("### Resultados de la Prueba de Dickey-Fuller Aumentada\n\n",
+    "- **Prueba**: Dickey-Fuller Aumentada (ADF)\n",
+    "- **Resultado**: ", resultadf, "\n", sep = "")
+```
+
+Hay que realizar transformación a los datos. Mediante una transformación de Box-cox, veremos cual es la conveniente.
+
+```{r, include=FALSE}
+BoxCox.lambda(Xt_players)
+#0.3418106
+Xt_sqrt = sqrt(Xt_players)
+```
+
+Box Cox da un valor lambda = 0.3418106, por lo que aplicar raíz a los datos es la transformación adecuada. Con los datos transformados, comprobamos si ahora se existe estacionariedad, con la misma prueba de antes, llegamos a que
+
+```{r, echo=FALSE}
+dataDF2 = data.frame(
+  tiempo = time(Xt_players),     
+  players = as.vector(Xt_players),
+  players_sqrt = as.vector(sqrt(Xt_players))
+)
+
+reg_mod2 = lm(players_sqrt ~ tiempo , data = dataDF2)
+
+resultbp2 <- ifelse(bptest(reg_mod2)$p.value < alpha,
+                    "Es heterocedástica",
+                    "Evidencia de hocedasticidad")
+
+resultncv2 <- ifelse(ncvTest(reg_mod2)$p < alpha,
+                    "Es heterocedástica",
+                    "Evidencia de hocedasticidad")
+
+resultadf2 <- ifelse(adf.test(Xt_sqrt)$p.value < alpha,
+                     "Hay evidencia de estacionariedad", 
+                     "No es estacionaria")
+
+
+cat("### Resultados de la Prueba de Breusch-Pagan\n\n",
+    "- **Prueba**: Breusch-Pagan (BP)\n",
+    "- **Resultado**: ", resultbp2, "\n",
+
+    "\n### Resultados de la Prueba de Non-Constant Variance\n\n",
+    "- **Prueba**: Non-Constant Variance (ncv)\n",
+    "- **Resultado**: ", resultncv2, "\n",
+
+    "\n### Resultados de la Prueba de Dickey-Fuller Aumentada\n\n",
+    "- **Prueba**: Dickey-Fuller Aumentada (ADF)\n",
+    "- **Resultado**: ", resultadf2, "\n", sep = "")
+
+```
+
+Ahora aplicaremos las diferenciaciones necesarias para estabilizar la varianza.
+
+```{r,echo=FALSE}
+resultados = data.frame(d = integer(), D = integer(), varianza = numeric())
+
+# Loop para probar diferentes valores de d y D
+for (d in 0:4) {
+  for (D in 0:4) {
+    if (d == 0 && D == 0) {
+      diff_series = Xt_sqrt
+    } else if (d == 0 && D > 0) {
+      diff_series <- diff(Xt_sqrt, lag = 12, differences = D)
+    } else if (d > 0 && D == 0) {
+      diff_series <- diff(Xt_sqrt, lag = 1, differences = d)
+    } else {
+      diff_series <- diff(diff(Xt_sqrt, lag = 12, differences = D), lag = 1, differences = d)
+    }
+    varianza_diff <- var(diff_series, na.rm = TRUE)
+    resultados <- rbind(resultados, data.frame(d = d, D = D, varianza = varianza_diff))
+  }
+}
+
+# Buscamos el índice del de menor varianza.
+indx_min = which.min(resultados$varianza)
+best_d_D = as.data.frame(resultados[indx_min, ])
+kable(best_d_D)
+
+```
+
+```{r wn_serie, echo=FALSE}
+# Serie diferenciada y con transformación Box-Cox
+Wt_players = diff(Xt_sqrt, lag = 1, differences = 1) # s=12, d=1, D=0
+
+par(mar=c(1,1,1,1))
+tsdisplay(Wt_players, lwd=0.5)
+
+# Prueba Dickey-Fuller Aumentada
+alpha <- 0.05
+suppressWarnings(ifelse(adf.test(Wt_players)$p.value < alpha, "Hay evidencia de estacionariedad", "No es estacionaria"))
+
+```
+La serie transformada (con raíz cuadrada y una diferenciación) parece haberse estabilizado bien, eliminando cualquier tendencia. No se observa un patrón claro de estacionalidad.
+
+En el ACF, solo unos pocos lags cruzan los límites de significancia, lo que indica que la autocorrelación no es fuerte y la serie parece suficientemente diferenciada. Ademas de un pico en el primer lag, posiblemente de un valor q = 1
+
+El PACF muestra picos en los primeros lags, sugiriendo un componente autoregresivo con un pequeño valor de p (posiblemente p = 1 o p = 2).
+
+La serie podría ser modelada con un ARIMA básico, ya que d = 1 parece suficiente.
+\newpage
+
+\subsection{Modelación}
+
+Primero veamos los correlogramas:
+
+
+```{r correlogramas, echo=FALSE, fig.dim=c(7,3)}
+par(mfrow=c(1,2))
+par(mar=c(4,4,2,1))
+acf(Xt_players, main="")
+pacf(Xt_players, main="")
+mtext("Análisis de Autocorrelación", side = 3, line = 0.5, outer = TRUE, cex = 1.5)
+par(mfrow=c(1,1))
+```
+
+
+Se ajustan distintos modelos:
+
+\begin{enumerate}
+   \item model1: $SARIMA(1, 1, 1)X(1,0,0)_{12}$
+   \item model2: $SARIMA(1, 1, 1)X(1,0,0)_{12}$
+   \item model3: $SARIMA(2,1,1)X(1,0,0)_{12}$
+\end{enumerate}
+
+
+```{r, include=FALSE}
+
+#Mejor modelo segun R (auto.arima)
+model1 = auto.arima(Xt_sqrt)
+summary(model1)
+confint(model1)
+
+#El intervalo para el ar1 incluye el 0, por lo que es plausible tener un modelo sin parte autoregresiva
+
+#Modelo con parte AR estacional.
+model2 = arima(Xt_sqrt, order=c(0,1,1), seasonal=list(order=c(1,0,0), period=12))
+summary(model2)
+confint(model2)
+
+
+```
+
+
+```{r, include=FALSE}
+#Finalmente, dado lo observado en el ACF y PACF se ajusta otro modelo
+#Pero con la parte AR = 2
+
+model3 = arima(Xt_sqrt, order=c(2,1,1), seasonal=list(order=c(1,0,0), period=12))
+summary(model3)
+confint(model3)
+```
+
+Gráfico de los modelos.
+
+```{r models_plot, echo=FALSE, fig.dim=c(7,4)}
+plot(fitted(model3),lwd=1, main="serie sqrt",xlab="años",ylab="Players", col="darkblue")
+lines(fitted(model1),col="red",lwd=1)
+lines(fitted(model2),col="green",lwd=1)
+lines(Xt_sqrt,col="black",lwd=1)
+legend("topleft", legend = c("serie", "model1", "model2", "model3"), 
+       col = c("black", "red", "green", "darkblue"), lty = 1, lwd = 2, cex = 1)
+
+```
+
+
+\subsection{BIC por modelo}
+
+```{r, echo=FALSE}
+########################################
+#
+#                BIC
+#
+########################################
+
+
+print(paste("BIC model1",BIC(model1)))
+print(paste("BIC model2",BIC(model2)))
+print(paste("BIC model3",BIC(model3)))
+
+```
+El modelo con menor BIC es el primer modelo, veamos como se comporta el RMSE.
+
+\subsection{RMSE de cada modelo}
+
+```{r, echo=FALSE}
+print(paste("RMSE model1",sqrt(mean((model1$fitted-Xt_sqrt)^2))))
+
+print(paste("RMSE model2",sqrt(mean((fitted(model2)-Xt_sqrt)^2))))
+
+print(paste("RMSE model3",sqrt(mean((fitted(model3)-Xt_sqrt)^2))))
+
+
+```
+
+Usaremos model3 para las predicciones, veamos primero si cumple los supuestos.
+
+\subsection{Verificacion de supuestos:}
+
+```{r residuals_plot, include=FALSE}
+#Modelo 1
+qqnorm(model1$residuals,cex=1,lwd=2, main="Q-Q Plot Model 1")
+qqline(model1$residuals,col="red",cex=0.5,lwd=2)
+
+###Prueba de Anderson-Darling###
+ad.test(model1$residuals)
+###Prueba de Lilliefors (Kolmogorov-Smirnov)###
+lillie.test(model1$residuals)
+
+
+#Modelo 2
+qqnorm(model2$residuals,cex=1,lwd=2, main="Q-Q Plot MOdel 2")
+qqline(model2$residuals,col="red",cex=0.5,lwd=2)
+
+###Prueba de Anderson-Darling###
+ad.test(model2$residuals)
+###Prueba de Lilliefors (Kolmogorov-Smirnov)###
+lillie.test(model2$residuals)
+
+```
+
+```{r,echo=FALSE}
+#Modelo 3
+qqnorm(model3$residuals,cex=1,lwd=2, main="Q-Q Plot Model 3")
+qqline(model3$residuals,col="red",cex=0.5,lwd=2)
+
+###Prueba de Anderson-Darling###
+ad.test(model3$residuals)
+###Prueba de Lilliefors (Kolmogorov-Smirnov)###
+lillie.test(model3$residuals)
+```
+El modelo no cumple la normalidad, sin embargo por teorema de límite central no importa mucho.
+
+\subsection{Homocedasticidad} 
+
+```{r plot_homo, include=FALSE}
+#Homocedasticidad modelo 1
+plot(model1$residuals,cex=0.5,type="p",pch=19, main="Gáfica de residuales model 1", xlab="residuales", ylab="")
+
+Y1 = as.numeric(model1$residuals)
+X1 = 1:length(model1$residuals)
+
+bptest(Y1 ~ X1)
+
+```
+
+```{r plot_homo2, include=FALSE}
+#Homocedasticidad modelo 2
+plot(model2$residuals,cex=0.5,type="p",pch=19, main="Gáfica de residuales model 2", xlab="residuales", ylab="")
+
+Y2 = as.numeric(model2$residuals)
+X2 = 1:length(model2$residuals)
+
+bptest(Y2 ~ X2)
+```
+
+```{r plot_homo3, echo=FALSE}
+#Homocedasticidad en el modelo 3
+plot(model3$residuals,cex=0.5,type="p",pch=19, main="Gáfica de residuales model 3", xlab="residuales", ylab="")
+
+Y3 = as.numeric(model3$residuals)
+X3 = 1:length(model3$residuals)
+
+bptest(Y3 ~ X3)
+```
+El supuesto de homocedasticidad se cumple.
+
+\subsection{Independencia}
+
+```{r, include=FALSE}
+#Modelo 1
+#H0: NO-correlacion = Independencia
+Box.test(model1$residuals,lag=1)
+Box.test(model1$residuals,lag=2)
+Box.test(model1$residuals,lag=3)
+Box.test(model1$residuals,lag=4)
+Box.test(model1$residuals,lag=12)
+Box.test(model1$residuals,lag=13)
+Box.test(model1$residuals,lag=24)
+Box.test(model1$residuals,lag=25)
+Box.test(model1$residuals,lag=26)
+
+#Modelo 2
+#H0: NO-correlacion = Independencia
+Box.test(model2$residuals,lag=1)
+Box.test(model2$residuals,lag=2)
+Box.test(model2$residuals,lag=3)
+Box.test(model2$residuals,lag=4)
+Box.test(model2$residuals,lag=12)
+Box.test(model2$residuals,lag=13)
+Box.test(model2$residuals,lag=24)
+Box.test(model2$residuals,lag=25)
+Box.test(model2$residuals,lag=26)
+
+```
+```{r,echo=FALSE}
+#Modelo 3
+#H0: NO-correlacion = Independencia
+Box.test(model3$residuals,lag=1)
+Box.test(model3$residuals,lag=2)
+Box.test(model3$residuals,lag=3)
+Box.test(model3$residuals,lag=4)
+Box.test(model3$residuals,lag=12)
+Box.test(model3$residuals,lag=13)
+Box.test(model3$residuals,lag=24)
+Box.test(model3$residuals,lag=25)
+Box.test(model3$residuals,lag=26)
+```
+
+
+
+Se verifica que se cumple la independencia. 
+
+
+
+```{r,include=FALSE}
+train_size = floor(0.8 * length(Xt_sqrt))
+Xt_train = Xt_sqrt[1:train_size]
+Xt_test = Xt_sqrt[(train_size+1):length(Xt_sqrt)]
+
+Xt2_train = ts(Xt_train, 
+               start=c(2012,6), frequency=frequency(Xt_sqrt) )
+
+Xt2_test = ts(Xt_test, 
+              start=c(2022,3), frequency=frequency(Xt_sqrt) ) 
+
+
+#Modelos entrenados con Train
+#Modelo autarima
+model1t = arima(Xt2_train, order=c(1,1,1), seasonal=list(order=c(1,0,0), period=12))
+#Modelo sin un parametro que era no significativo
+model2t = arima(Xt2_train, order=c(0,1,1), seasonal=list(order=c(1,0,0), period=12))
+#Modelo con AR(2)
+model3t = arima(Xt2_train, order=c(2,1,1), seasonal=list(order=c(1,0,0), period=12))
+
+```
+
+\subsection{Predicciones}
+Aunque los tres modelos ajustados no cumplen la normalidad, si cumplen los demás supuestos. Se usa model3 pues tiene menor RMSE en las predicciones.
+
+```{r forecast_plot, echo=FALSE,fig.dim=c(7,5)}
+#Predicciones
+pred_time = length(Xt_test)
+
+
+predicciones1 = predict(model1t, n.ahead = pred_time)
+predicciones2 = predict(model2t, n.ahead = pred_time)
+predicciones3 = predict(model3t, n.ahead = pred_time)
+
+# Calcular los intervalos de confianza (95%)
+
+# Calcular los intervalos de confianza para el modelo 1
+predicted_values1 = predicciones1$pred
+error_standard1 = predicciones1$se
+lower_bound1 = predicted_values1 - 1.96 * error_standard1
+upper_bound1 = predicted_values1 + 1.96 * error_standard1
+
+# Calcular los intervalos de confianza para el modelo 2
+predicted_values2 = predicciones2$pred
+error_standard2 = predicciones2$se
+lower_bound2 = predicted_values2 - 1.96 * error_standard2
+upper_bound2 = predicted_values2 + 1.96 * error_standard2
+
+# Calcular los intervalos de confianza para el modelo C
+predicted_values3 = predicciones3$pred
+error_standard3 = predicciones3$se
+lower_bound3 = predicted_values3 - 1.96 * error_standard3
+upper_bound3 = predicted_values3 + 1.96 * error_standard3
+
+par(mfrow=c(1,3))
+par(mar=c(4,4,2,2))
+ts.plot(Xt2_test, predicted_values1, lower_bound1, upper_bound1, 
+        lty=c(1,1,2,2), col=c(1,2,4,4), lwd=2, main="Test con Modelo 1")
+
+ts.plot(Xt2_test, predicted_values2, lower_bound2, upper_bound2, 
+        lty=c(1,1,2,2), col=c(1,2,4,4), lwd=2, main="Test con Modelo 2")
+
+ts.plot(Xt2_test, predicted_values3, lower_bound3, upper_bound3, 
+        lty=c(1,1,2,2), col=c(1,2,4,4), lwd=2, main="Test con Modelo 3")
+
+#RMSE de las predicciones
+
+print(paste("RMSE model1t",sqrt(mean((predicted_values1-Xt2_test)^2))))
+
+print(paste("RMSE model2t",mean(sqrt((predicted_values2-Xt2_test)^2))))
+
+print(paste("RMSE model3t",mean(sqrt((predicted_values3-Xt2_test)^2))))
+
+
+```
+
+```{r,echo=FALSE, fig.dim=c(7,4)}
+# Predicción del tercer modelo
+forecasting_sqrt = forecast(model3, level = c(95), h = 24)
+forecasting_or = forecast(model3, level = c(95), h = 24)
+
+# Escala original
+datos_originales = (forecasting_or$x)^2
+forecasting_or$x = datos_originales
+predicciones_original = (forecasting_or$mean)^2
+forecasting_or$mean = predicciones_original
+lower_bound_original = (forecasting_or$lower)^2
+forecasting_or$lower =lower_bound_original
+upper_bound_original = (forecasting_or$upper)^2
+forecasting_or$upper=upper_bound_original
+# Graficar la predicción en escala original
+plot(forecasting_or, main = "Predicción con el modelo3 a 2 años",
+     xlab="Año", ylab="Prom. No de jugadores")
+```
+En conclusión vemos que nuestras predicciones tenderán a ser decrecientes, pero 
+gracias a los intevalos de confianza podemos ver que no es el mejor modelo 
+que le podemos ajustar
+
+Finalmente al tener intervalos de confianza más grnades se decide aplicarun modelo
+más sencillo, el cual será el modelo Holt-Winter multiplicativo aplicado a la serie del promedio de jugadores mensuales $Xt$_$players$
+
+```{r,echo=FALSE, fig.dim=c(7,4)}
+# Usando el pronóstico Holt-Winters
+
+predholt <- HoltWinters(Xt_sqrt, seasonal = "multiplicative")
+predfinal <- forecast(predholt, h=24) #prediccion de 2 años
+plot(predfinal, main="Pronóstico jugadores Holt-Winters multiplicativo", xlab="año", ylab="Prom. No de jugadores")
+
+```
+
+Concluimos que gracias a los intervalos, el modelo Holt-Winters multiplicativo 
+nos sirve mejor para poder hacer las predicciones en este caso a dos años
+
